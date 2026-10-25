@@ -11,9 +11,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Read the environment variable by its key name
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# --- Audio Transcoders (Twilio 8kHz mu-law <-> Gemini PCM) ---
+# --- Audio Transcoders (Twilio 8kHz mu-law <-> Gemini PCM 16kHz/24kHz) ---
 def _ulaw2lin(u):
     u = ~u & 0xFF
     sign = u & 0x80
@@ -30,10 +31,12 @@ def mulaw_to_pcm16_upsample(mulaw_bytes):
     for b in mulaw_bytes:
         s = MULAW_TO_PCM16[b]
         low, high = s & 0xFF, (s >> 8) & 0xFF
+        # Upsample 8kHz -> 16kHz by sample doubling
         pcm.extend((low, high, low, high))
     return bytes(pcm)
 
 def pcm24k_to_mulaw8k(pcm_bytes):
+    # Downsample 24kHz -> 8kHz (decimate by 3)
     mulaw = bytearray()
     for i in range(0, len(pcm_bytes) - 5, 6):
         sample = int.from_bytes(pcm_bytes[i:i+2], byteorder="little", signed=True)
@@ -52,7 +55,7 @@ def pcm24k_to_mulaw8k(pcm_bytes):
         mulaw.append((~(sign | (exponent << 4) | mantissa)) & 0xFF)
     return bytes(mulaw)
 
-# --- FastAPI Server ---
+# --- FastAPI App ---
 app = FastAPI()
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
@@ -64,7 +67,7 @@ async def call_instructions(request: Request):
     connect = Connect()
     connect.stream(url=f"wss://{host}/media-stream")
     vr.append(connect)
-    vr.pause(length=30)
+    vr.pause(length=60)
     return Response(content=str(vr), media_type="application/xml")
 
 @app.websocket("/media-stream")
@@ -72,6 +75,11 @@ async def handle_media_stream(websocket: WebSocket):
     await websocket.accept()
     print("Twilio WebSocket connected!")
     stream_sid = None
+
+    if not GEMINI_API_KEY:
+        print("ERROR: GEMINI_API_KEY environment variable is missing!")
+        await websocket.close()
+        return
 
     gemini_url = (
         f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
@@ -94,7 +102,9 @@ async def handle_media_stream(websocket: WebSocket):
                         }
                     },
                     "systemInstruction": {
-                        "parts": [{"text": "You are a warm, polite AI phone assistant. Keep all responses very brief, natural, and under 1-2 sentences."}]
+                        "parts": [{
+                            "text": "You are a helpful, conversational phone assistant. Keep answers concise, natural, and under two sentences."
+                        }]
                     }
                 }
             }
@@ -108,10 +118,12 @@ async def handle_media_stream(websocket: WebSocket):
                     while True:
                         msg = await websocket.receive_text()
                         data = json.loads(msg)
-                        if data["event"] == "start":
+                        event = data.get("event")
+
+                        if event == "start":
                             stream_sid = data["start"]["streamSid"]
-                            print(f"Call started with SID: {stream_sid}")
-                        elif data["event"] == "media":
+                            print(f"Call streaming started. SID: {stream_sid}")
+                        elif event == "media":
                             raw_mulaw = base64.b64decode(data["media"]["payload"])
                             pcm16 = mulaw_to_pcm16_upsample(raw_mulaw)
                             gemini_msg = {
@@ -123,10 +135,14 @@ async def handle_media_stream(websocket: WebSocket):
                                 }
                             }
                             await gemini_ws.send(json.dumps(gemini_msg))
+                        elif event == "stop":
+                            print("Twilio sent stop event.")
+                            break
                 except Exception as e:
-                    print(f"Twilio handler error: {e}")
+                    print(f"Twilio sender error: {e}")
 
             async def from_gemini():
+                nonlocal stream_sid
                 try:
                     async for raw_msg in gemini_ws:
                         resp = json.loads(raw_msg)
@@ -147,12 +163,15 @@ async def handle_media_stream(websocket: WebSocket):
                                 }))
 
                         if server_content.get("interrupted") and stream_sid:
-                            await websocket.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
+                            await websocket.send_text(json.dumps({
+                                "event": "clear",
+                                "streamSid": stream_sid
+                            }))
                 except Exception as e:
-                    print(f"Gemini handler error: {e}")
+                    print(f"Gemini receiver error: {e}")
 
             await asyncio.gather(from_twilio(), from_gemini())
 
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        print(f"Connection error: {e}")
         traceback.print_exc()
