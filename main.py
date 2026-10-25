@@ -115,4 +115,44 @@ async def handle_media_stream(websocket: WebSocket):
                             raw_mulaw = base64.b64decode(data["media"]["payload"])
                             pcm16 = mulaw_to_pcm16_upsample(raw_mulaw)
                             gemini_msg = {
-                                "
+                                "realtimeInput": {
+                                    "mediaChunks": [{
+                                        "mimeType": "audio/pcm;rate=16000",
+                                        "data": base64.b64encode(pcm16).decode("utf-8")
+                                    }]
+                                }
+                            }
+                            await gemini_ws.send(json.dumps(gemini_msg))
+                except Exception as e:
+                    print(f"Twilio handler error: {e}")
+
+            async def from_gemini():
+                try:
+                    async for raw_msg in gemini_ws:
+                        resp = json.loads(raw_msg)
+                        server_content = resp.get("serverContent", {})
+                        model_turn = server_content.get("modelTurn", {})
+                        parts = model_turn.get("parts", [])
+
+                        for part in parts:
+                            inline_data = part.get("inlineData", {})
+                            if inline_data.get("mimeType", "").startswith("audio/pcm") and stream_sid:
+                                pcm24_bytes = base64.b64decode(inline_data["data"])
+                                mulaw_bytes = pcm24k_to_mulaw8k(pcm24_bytes)
+                                twilio_payload = base64.b64encode(mulaw_bytes).decode("utf-8")
+                                await websocket.send_text(json.dumps({
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {"payload": twilio_payload}
+                                }))
+
+                        if server_content.get("interrupted") and stream_sid:
+                            await websocket.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
+                except Exception as e:
+                    print(f"Gemini handler error: {e}")
+
+            await asyncio.gather(from_twilio(), from_gemini())
+
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        traceback.print_exc()
