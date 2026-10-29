@@ -31,11 +31,13 @@ def mulaw_to_pcm16_upsample(mulaw_bytes):
     for b in mulaw_bytes:
         s = MULAW_TO_PCM16[b]
         low, high = s & 0xFF, (s >> 8) & 0xFF
+        # Upsample 8kHz -> 16kHz by sample doubling
         pcm.extend((low, high, low, high))
     return bytes(pcm)
 
 def pcm24k_to_mulaw8k(pcm_bytes):
     mulaw = bytearray()
+    # Downsample 24kHz -> 8kHz (decimate by picking every 3rd 16-bit sample / every 6 bytes)
     for i in range(0, len(pcm_bytes) - 5, 6):
         sample = int.from_bytes(pcm_bytes[i:i+2], byteorder="little", signed=True)
         sign = 0x80 if sample < 0 else 0
@@ -70,7 +72,7 @@ async def call_instructions(request: Request):
     connect = Connect()
     connect.stream(url=f"wss://{host}/media-stream")
     vr.append(connect)
-    vr.pause(length=60)
+    # vr.pause removed so Twilio cleanly manages the live stream lifecycle
     return Response(content=str(vr), media_type="application/xml")
 
 @app.websocket("/media-stream")
@@ -143,6 +145,8 @@ async def handle_media_stream(websocket: WebSocket):
                         elif event == "stop":
                             print("Twilio sent stop event.", flush=True)
                             break
+                except websockets.exceptions.ConnectionClosed:
+                    pass
                 except Exception as e:
                     print(f"Twilio receiver loop error: {e}", flush=True)
 
@@ -172,10 +176,16 @@ async def handle_media_stream(websocket: WebSocket):
                                 "event": "clear",
                                 "streamSid": stream_sid
                             }))
+                except websockets.exceptions.ConnectionClosed:
+                    pass
                 except Exception as e:
                     print(f"Gemini receiver loop error: {e}", flush=True)
 
-            await asyncio.gather(from_twilio(), from_gemini())
+            # Runs both directions concurrently; cancels cleanly if either connection closes
+            tasks = [asyncio.create_task(from_twilio()), asyncio.create_task(from_gemini())]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
 
     except Exception as e:
         print(f"WebSocket error during session: {e}", flush=True)
