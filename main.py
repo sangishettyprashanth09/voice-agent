@@ -6,7 +6,6 @@ import traceback
 import websockets
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import Response, PlainTextResponse
-from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,11 +29,13 @@ def mulaw_to_pcm16_upsample(mulaw_bytes):
     for b in mulaw_bytes:
         s = MULAW_TO_PCM16[b]
         low, high = s & 0xFF, (s >> 8) & 0xFF
+        # Upsample 8kHz -> 16kHz by sample doubling
         pcm.extend((low, high, low, high))
     return bytes(pcm)
 
 def pcm24k_to_mulaw8k(pcm_bytes):
     mulaw = bytearray()
+    # Downsample 24kHz -> 8kHz (decimate by picking every 3rd 16-bit sample / every 6 bytes)
     for i in range(0, len(pcm_bytes) - 5, 6):
         sample = int.from_bytes(pcm_bytes[i:i+2], byteorder="little", signed=True)
         sign = 0x80 if sample < 0 else 0
@@ -65,7 +66,6 @@ async def call_instructions(request: Request):
     host = request.headers.get("host")
     print(f"Call requested. Host: {host}", flush=True)
 
-    # Standard compliant Twilio Media Stream TwiML (NO track attribute inside <Connect>)
     xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
@@ -98,7 +98,7 @@ async def handle_media_stream(websocket: WebSocket):
 
             setup_message = {
                 "setup": {
-                    "model": "models/gemini-2.0-flash-exp",
+                    "model": "models/gemini-2.0-flash-realtime-exp",
                     "generationConfig": {
                         "responseModalities": ["AUDIO"],
                         "speechConfig": {
@@ -131,7 +131,7 @@ async def handle_media_stream(websocket: WebSocket):
                         elif event == "start":
                             stream_sid = data["start"]["streamSid"]
                             print(f"Stream started! Twilio Stream SID: {stream_sid}", flush=True)
-                            # Prompt Gemini to speak first
+                            # Prompt Gemini to greet immediately
                             greet_prompt = {
                                 "clientContent": {
                                     "turns": [{
@@ -157,6 +157,8 @@ async def handle_media_stream(websocket: WebSocket):
                         elif event == "stop":
                             print("Twilio sent stop event.", flush=True)
                             break
+                except websockets.exceptions.ConnectionClosed:
+                    pass
                 except Exception as e:
                     print(f"Twilio receiver loop error: {e}", flush=True)
 
@@ -186,10 +188,15 @@ async def handle_media_stream(websocket: WebSocket):
                                 "event": "clear",
                                 "streamSid": stream_sid
                             }))
+                except websockets.exceptions.ConnectionClosed:
+                    pass
                 except Exception as e:
                     print(f"Gemini receiver loop error: {e}", flush=True)
 
-            await asyncio.gather(from_twilio(), from_gemini())
+            tasks = [asyncio.create_task(from_twilio()), asyncio.create_task(from_gemini())]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
 
     except Exception as e:
         print(f"WebSocket error during session: {e}", flush=True)
