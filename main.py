@@ -29,13 +29,13 @@ def mulaw_to_pcm16_upsample(mulaw_bytes):
     for b in mulaw_bytes:
         s = MULAW_TO_PCM16[b]
         low, high = s & 0xFF, (s >> 8) & 0xFF
-        # Upsample 8kHz -> 16kHz by sample doubling
+        # Upsample 8kHz -> 16kHz by duplicating samples
         pcm.extend((low, high, low, high))
     return bytes(pcm)
 
 def pcm24k_to_mulaw8k(pcm_bytes):
     mulaw = bytearray()
-    # Downsample 24kHz -> 8kHz (decimate by picking every 3rd 16-bit sample / every 6 bytes)
+    # Downsample 24kHz -> 8kHz (pick every 3rd 16-bit sample / every 6 bytes)
     for i in range(0, len(pcm_bytes) - 5, 6):
         sample = int.from_bytes(pcm_bytes[i:i+2], byteorder="little", signed=True)
         sign = 0x80 if sample < 0 else 0
@@ -53,7 +53,7 @@ def pcm24k_to_mulaw8k(pcm_bytes):
         mulaw.append((~(sign | (exponent << 4) | mantissa)) & 0xFF)
     return bytes(mulaw)
 
-# --- FastAPI App ---
+# --- FastAPI Server ---
 app = FastAPI()
 
 @app.get("/")
@@ -66,11 +66,13 @@ async def call_instructions(request: Request):
     host = request.headers.get("host")
     print(f"Call requested. Host: {host}", flush=True)
 
+    # Added <Pause length="60"/> to prevent Twilio from hanging up during handshake
     xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
         <Stream url="wss://{host}/media-stream" />
     </Connect>
+    <Pause length="60"/>
 </Response>"""
     return Response(content=xml_content, media_type="application/xml")
 
@@ -98,7 +100,7 @@ async def handle_media_stream(websocket: WebSocket):
 
             setup_message = {
                 "setup": {
-                    "model": "models/gemini-2.0-flash-realtime-exp",
+                    "model": "models/gemini-2.0-flash-exp",
                     "generationConfig": {
                         "responseModalities": ["AUDIO"],
                         "speechConfig": {
@@ -109,14 +111,16 @@ async def handle_media_stream(websocket: WebSocket):
                     },
                     "systemInstruction": {
                         "parts": [{
-                            "text": "You are a helpful phone assistant. As soon as the call connects, greet the caller with 'Hello! How can I help you today?' Keep all answers concise, conversational, and under two sentences."
+                            "text": "You are a friendly, concise AI phone assistant. Greet the user when they speak and keep all answers under 2 sentences."
                         }]
                     }
                 }
             }
             await gemini_ws.send(json.dumps(setup_message))
-            setup_ack = await gemini_ws.recv()
-            print(f"Gemini setup acknowledged: {setup_ack}", flush=True)
+
+            # Read initial setup completion response from Gemini
+            raw_setup_resp = await gemini_ws.recv()
+            print(f"Gemini setup response received: {raw_setup_resp}", flush=True)
 
             async def from_twilio():
                 nonlocal stream_sid
@@ -131,17 +135,19 @@ async def handle_media_stream(websocket: WebSocket):
                         elif event == "start":
                             stream_sid = data["start"]["streamSid"]
                             print(f"Stream started! Twilio Stream SID: {stream_sid}", flush=True)
-                            # Prompt Gemini to greet immediately
-                            greet_prompt = {
+
+                            # Trigger an initial spoken greeting
+                            greet_msg = {
                                 "clientContent": {
                                     "turns": [{
                                         "role": "user",
-                                        "parts": [{"text": "The caller has picked up the phone. Greet them."}]
+                                        "parts": [{"text": "Hello, I just answered the call. Please introduce yourself briefly."}]
                                     }],
                                     "turnComplete": True
                                 }
                             }
-                            await gemini_ws.send(json.dumps(greet_prompt))
+                            await gemini_ws.send(json.dumps(greet_msg))
+
                         elif event == "media":
                             raw_mulaw = base64.b64decode(data["media"]["payload"])
                             pcm16 = mulaw_to_pcm16_upsample(raw_mulaw)
@@ -154,11 +160,12 @@ async def handle_media_stream(websocket: WebSocket):
                                 }
                             }
                             await gemini_ws.send(json.dumps(gemini_msg))
+
                         elif event == "stop":
                             print("Twilio sent stop event.", flush=True)
                             break
                 except websockets.exceptions.ConnectionClosed:
-                    pass
+                    print("Twilio connection closed normally.", flush=True)
                 except Exception as e:
                     print(f"Twilio receiver loop error: {e}", flush=True)
 
@@ -189,7 +196,7 @@ async def handle_media_stream(websocket: WebSocket):
                                 "streamSid": stream_sid
                             }))
                 except websockets.exceptions.ConnectionClosed:
-                    pass
+                    print("Gemini connection closed normally.", flush=True)
                 except Exception as e:
                     print(f"Gemini receiver loop error: {e}", flush=True)
 
@@ -199,5 +206,5 @@ async def handle_media_stream(websocket: WebSocket):
                 task.cancel()
 
     except Exception as e:
-        print(f"WebSocket error during session: {e}", flush=True)
+        print(f"WebSocket session error: {e}", flush=True)
         traceback.print_exc()
