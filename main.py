@@ -88,7 +88,7 @@ async def handle_media_stream(websocket: WebSocket):
         return
 
     gemini_url = (
-        f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
         f"?key={GEMINI_API_KEY}"
     )
 
